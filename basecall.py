@@ -13,6 +13,12 @@ from fast_ctc_decode import beam_search
 from ont_fast5_api.fast5_interface import get_fast5_file
 from torch.multiprocessing import Queue, Process
 
+from bonito.hedges_decode.hedges_decode_utils import hedges_batch_scores,unpack_basecalls
+from bonito.hedges_decode.hedges_decode import hedges_decode
+from functools import partial
+
+
+
 import model as network
 import ont
 
@@ -64,9 +70,19 @@ def mp_files(dir, queue, config, args):
     chunks = None
     queuechunks = None
     chunkremainder = None
-    for file in glob.iglob(dir+"/**/*.fast5", recursive=True):
+    read_counter=0
+    for file in glob.iglob(dir+"/*.fast5", recursive=True):
         f5 = get_fast5_file(file, mode="r")
+        if read_counter>=args.upper_index: break 
         for read in f5.get_reads():
+            # print("{}".format(read_counter))
+            if read_counter<args.lower_index:#set some index ranges for signals
+                read_counter+=1
+                continue
+            if read_counter>=args.upper_index:
+                break
+            read_counter+=1
+            print(read_counter)
             while queue.qsize() >= 100:
                 time.sleep(1)
             #outfile = os.path.splitext(os.path.basename(file))[0]
@@ -88,6 +104,8 @@ def mp_files(dir, queue, config, args):
                 queuechunks = [read.read_id] * newchunks.shape[0]
             if chunks.shape[0] >= args.batchsize:
                 for i in range(0, chunks.shape[0]//args.batchsize, args.batchsize):
+                    #print("CHUNK")
+                    #print(queuechunks[:args.batchsize])
                     queue.put((queuechunks[:args.batchsize], chunks[:args.batchsize]))
                     chunks = chunks[args.batchsize:]
                     queuechunks = queuechunks[args.batchsize:]
@@ -125,9 +143,11 @@ def mp_gpu(inqueue, outqueue, config, args):
                 shtensor = torch.empty((out.shape), pin_memory=True, dtype=out.dtype)
             logitspre = shtensor.copy_(out).numpy()
             if args.debug: print("mp_gpu:", logitspre.shape)
+            #print("HEDGES Placing {}".format(file))
+            #print("HEDGES SUM PLACE {}".format(torch.sum(torch.from_numpy(logitspre))))
             outqueue.put((file, logitspre))
             del out
-            del logitspre
+            #del logitspre
 
 def mp_write(queue, config, args):
     files = None
@@ -150,6 +170,9 @@ def mp_write(queue, config, args):
             while files.count(files[0]) < len(files) or finish:
                 totlen = files.count(files[0])
                 callchunk = chunks[:,:totlen,:]
+                #print("File {}".format(files[0]))
+                #print("BASE call Sum {}".format(torch.sum(torch.from_numpy(callchunk))))
+                #print("Call Chunk Dimensions {}".format(callchunk.shape))
                 logits = np.transpose(np.argmax(callchunk, -1), (1, 0))
                 label_blank = np.zeros((logits.shape[0], logits.shape[1] + 200))
                 try:
@@ -177,12 +200,83 @@ def mp_write(queue, config, args):
                 totprocessed+=1
                 if finish and not len(files): break
             if finish: break
+
+
+
+
+def RODAN_hedges_gen(queue):
+    files = None
+    chunks = None
+    totprocessed = 0
+    finish = False
+    while True:
+        if queue.qsize() > 0:
+            newchunk = queue.get()
+            #print("\n\nHEDGES Getting files {}\n\n".format(newchunk[0])) 
+            #print("\n\nHEDGES Getting Chunk Sum {}\n\n".format(torch.sum(torch.from_numpy(newchunk[1]))))
+            if type(newchunk[0]) == str:
+                if not len(files): break
+                finish = True
+            else:
+                if chunks is not None:
+                    chunks = np.concatenate((chunks, newchunk[1]), axis=1)
+                    files = files + newchunk[0]
+                else:
+                    chunks = newchunk[1]
+                    files = newchunk[0]
+            while files.count(files[0]) < len(files) or finish:
+                totlen = files.count(files[0])
+                callchunk = np.copy(chunks[:,:totlen,:])
+                callchunk=torch.from_numpy(callchunk)
+                #print(torch.sum(callchunk))
+                #reshape so that all chunks for a file are stacked on the same dimension
+                callchunk=torch.reshape(torch.permute(callchunk,(1,0,2)),(callchunk.size(0)*callchunk.size(1),callchunk.size(2)))
+                #flip the callchunk so that 5' scores are first in dim 0
+                #print("Current File {}".format(files[0]))
+                #print("Next File {}".format(files[totlen]))
+                #print(callchunk.size())
+                #print(torch.sum(callchunk))
+                callchunk=torch.flip(callchunk,(0,))
+                yield (files[0],{'scores':callchunk})
+                newchunks = chunks[:,totlen:,:]
+                chunks = newchunks
+                files = files[totlen:]
+                totprocessed+=1
+                if finish and not len(files): break
+        if finish: break
+
+            
+def hedges_write(queue, args):
+    with torch.no_grad():
+        alphabet=[ "N", "A", "C", "G", "T",]
+        files = None
+        chunks = None
+        totprocessed = 0
+        finish = False
+        calls = RODAN_hedges_gen(queue)
+        print("Dump")
+        pickle.dump([(read,s["scores"]) for read,s in calls],open("rna_benchmark_scores_strand1","wb+"))
+        print("Exiting after dump")
+        exit(1)
+        calls = hedges_batch_scores(calls,args.batch_size,windowsize=100)
+        decoder = partial(hedges_decode,hedges_params = args.hedges_params,hedges_bytes=args.hedges_bytes,
+                      using_hedges_DNA_constraint=False,
+                      alphabet=alphabet,endpoint_seq=args.strand_pad,window=args.window,
+                      trellis=args.trellis,mod_states=args.mod_states,rna=True)
+        calls = ((k,decoder(k,v)) for k,v in calls)
+        calls = unpack_basecalls(calls)
+        for read_id,r in calls: 
+            seq=r["sequence"] 
+            readid = os.path.splitext(os.path.basename(read_id))[0]
+            print(">"+readid)
+            print(seq)        
                 
 vocab = { 1:"A", 2:"C", 3:"G", 4:"T" }
 
 def ctcdecoder(logits, label, blank=False, beam_size=5, alphabet="NACGT", pre=None):
     ret = np.zeros((label.shape[0], label.shape[1]+50))
     retstr = []
+    #print(pre.shape)
     for i in range(logits.shape[0]):
         if pre is not None:
             beamcur = beam_search(torch.softmax(torch.tensor(pre[:,i,:]), dim=-1).cpu().detach().numpy(), alphabet=alphabet, beam_size=beam_size)[0]
@@ -206,6 +300,8 @@ def ctcdecoder(logits, label, blank=False, beam_size=5, alphabet="NACGT", pre=No
                 cur.append(vocab[logits[i,pos]])
                 pos+=1
         if pre is not None:
+            #print(beamcur)
+            #print(pre[100:200,10,:])
             retstr.append(beamcur)
         else:
             retstr.append("".join(cur))
@@ -222,6 +318,17 @@ if __name__ == "__main__":
     parser.add_argument("-B", "--beamsize", default=5, type=int, help="CTC beam search size (default: 5)")
     parser.add_argument("-e", "--errors", default=False, action="store_true")
     parser.add_argument("-d", "--debug", default=False, action="store_true")
+    #add arguments for hedges
+    parser.add_argument("--hedges",default=False,action="store_true",help="Set if you want to use hedges decoding")
+    parser.add_argument("--hedges_params",default=None,help="Path to json file describing hedges parameter")
+    parser.add_argument("--hedges_bytes",type=int,default=None,nargs="+",help="Bytes to fastforward hedges state to")
+    parser.add_argument("--strand_pad",action="store",default="",help="Optional padding strand that will be aligned to trim score endpoints")
+    parser.add_argument("--window",action="store",type=float,default=0,help="window to use for ctc decoding")
+    parser.add_argument("--trellis",action="store",type=str,default="base",help="trellis type to use")
+    parser.add_argument("--mod_states",action="store",type=int,default=3,help="number of states per history")
+    parser.add_argument("--lower_index",action="store",type=int,default=0,help="Index to start for basecalling in the data set, INCLUSIVE")
+    parser.add_argument("--upper_index",action="store",type=int,default=10**9,help="Index to stop for basecalling, NOT_INCLUSIVE")
+    parser.add_argument("--batch_size",action="store",type=int,default=1,help="number of strands to batch for basecalling")
     args = parser.parse_args()
 
     torchdict = torch.load(args.model, map_location="cpu")
@@ -243,11 +350,14 @@ if __name__ == "__main__":
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.deterministic = True
 
-    call_queue = Queue()
-    write_queue = Queue()
+    call_queue = Queue(maxsize=1)
+    write_queue = Queue(maxsize=1)
     p1 = Process(target=mp_files, args=(args.fast5dir, call_queue, config, args,))
     p2 = Process(target=mp_gpu, args=(call_queue, write_queue, config, args,))
-    p3 = Process(target=mp_write, args=(write_queue, config, args,))
+    if not args.hedges:
+        p3 = Process(target=mp_write, args=(write_queue, config, args,))
+    else:
+        p3 = Process(target=hedges_write,args=(write_queue,args,))
     p1.start()
     p2.start()
     p3.start()
